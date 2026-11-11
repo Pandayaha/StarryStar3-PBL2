@@ -1,0 +1,2 @@
+# Preserve project file bytes, including legacy text encodings.
+* -text
