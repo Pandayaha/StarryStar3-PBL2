@@ -93,6 +93,18 @@ public class ChineseAsterismController : MonoBehaviour
         return objectDefinitions.TryGetValue(id, out var definition) ? definition.hr : 0;
     }
 
+    internal IReadOnlyList<string> RegionPatternIds(int region) => RegionAsterismIds[region];
+    internal Transform GetMemberTransform(string id) => objectTransforms[id];
+
+    internal void FocusPattern(string id)
+    {
+        if (!IsRegionVisible) return;
+        int index = Array.IndexOf(RegionAsterismIds[selection.SelectedIndex], id);
+        if (index < 0 || index == focusedAsterismIndex) return;
+        focusedAsterismIndex = index;
+        ApplyFocus();
+    }
+
     public Font LabelFont => labelFont;
     public void Initialize(List<StarDataLoader.Star> stars, List<GameObject> starObjects)
     {
@@ -304,12 +316,8 @@ public class ChineseAsterismController : MonoBehaviour
         activeHolders.Add(holder);
         foreach (var edge in definition.segments)
         {
-            var line = NewLine(holder, edge.fromId + " -> " + edge.toId, 0.8f, new Color(1f, 0.78f, 0.3f, 0.95f));
-            Vector3 a = LocalPosition(edge.fromId), b = LocalPosition(edge.toId);
-            Vector3 trim = (b - a).normalized * Mathf.Min(3f, (b - a).magnitude * 0.2f);
-            line.positionCount = 2;
-            line.SetPosition(0, a + trim);
-            line.SetPosition(1, b - trim);
+            DrawPatternEdge(holder, edge.fromId + " -> " + edge.toId, objectTransforms[edge.fromId],
+                objectTransforms[edge.toId], 0.8f, new Color(1f, 0.78f, 0.3f, 0.95f));
             VisibleSegmentCount++;
         }
         foreach (string member in definition.memberIds)
@@ -332,6 +340,16 @@ public class ChineseAsterismController : MonoBehaviour
         label.color = new Color(1f, 0.85f, 0.45f);
         label.text = GetDisplayName(definition);
         labelObject.GetComponent<MeshRenderer>().sharedMaterial = labelFont.material;
+    }
+
+    internal void DrawPatternEdge(GameObject holder, string name, Transform from, Transform to, float width, Color colour)
+    {
+        var line = NewLine(holder, name, width, colour);
+        Vector3 a = transform.InverseTransformPoint(from.position), b = transform.InverseTransformPoint(to.position);
+        Vector3 trim = (b - a).normalized * Mathf.Min(3f, (b - a).magnitude * 0.2f);
+        line.positionCount = 2;
+        line.SetPosition(0, a + trim);
+        line.SetPosition(1, b - trim);
     }
 
     private LineRenderer NewLine(GameObject holder, string name, float width, Color colour)
@@ -357,14 +375,19 @@ public class ChineseAsterismController : MonoBehaviour
 
     private void DrawRing(GameObject holder, string id, string prefix, float radius, float width, Color colour)
     {
+        DrawPatternRing(holder, prefix + id, objectTransforms[id], radius, width, colour);
+    }
+
+    internal void DrawPatternRing(GameObject holder, string name, Transform star, float radius, float width, Color colour)
+    {
         // A ring indicates selection; its radius is symbolic, not a cluster's measured extent.
-        Vector3 position = LocalPosition(id);
+        Vector3 position = transform.InverseTransformPoint(star.position);
         Vector3 normal = position.normalized;
         Vector3 right = Vector3.Cross(normal, Vector3.up);
         if (right.sqrMagnitude < 0.001f) right = Vector3.Cross(normal, Vector3.right);
         right.Normalize();
         Vector3 up = Vector3.Cross(normal, right).normalized;
-        var line = NewLine(holder, prefix + id, width, colour);
+        var line = NewLine(holder, name, width, colour);
         line.loop = true;
         line.positionCount = 32;
         for (int i = 0; i < 32; i++)

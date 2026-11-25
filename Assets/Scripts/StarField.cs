@@ -17,12 +17,20 @@ public class StarField : MonoBehaviour {
   private int lastWesternConstellation;
   private bool westernSelectionEdited;
   private SkyCultureComparisonController comparison;
+  private SinglePatternPractice singlePattern;
+  private readonly Dictionary<int, Color> savedBrowseColours = new();
   private string savedChineseRegion;
   private bool savedChineseVisible;
   private readonly Dictionary<int, bool> savedWesternVisibility = new();
 
   public bool IsComparisonActive => comparison != null && comparison.IsActive;
   public bool IsBothCulturesVisible => !IsComparisonActive && showBoth;
+  public bool BrowseWesternAvailable => !IsComparisonActive && (!chineseMode || showBoth);
+  public bool BrowseChineseAvailable => !IsComparisonActive && (chineseMode || showBoth);
+  public int WesternPatternCount => WesternNames.Length;
+  public string GetWesternPatternName(int index) => WesternNames[index];
+  public bool IsWesternPatternVisible(int index) =>
+    constellationVisible.TryGetValue(index, out var holder) && holder != null && holder.activeSelf;
   private readonly Dictionary<int, TextMesh[]> westernLabels = new();
   private readonly Dictionary<int, GameObject> westernLabelRoots = new();
   private static readonly string[] WesternLabelRoots = {
@@ -65,6 +73,9 @@ public class StarField : MonoBehaviour {
     if (comparison == null)
       comparison = gameObject.AddComponent<SkyCultureComparisonController>();
     comparison.Initialize(stars, starObjects, chineseAsterisms, constellations);
+    singlePattern = GetComponent<SinglePatternPractice>();
+    if (singlePattern == null) singlePattern = gameObject.AddComponent<SinglePatternPractice>();
+    singlePattern.Initialize(this, chineseAsterisms, starObjects, constellations);
     var controls = GetComponent<SkyPracticeVrControls>();
     if (controls == null) controls = gameObject.AddComponent<SkyPracticeVrControls>();
     controls.Initialize(comparison);
@@ -161,6 +172,7 @@ public class StarField : MonoBehaviour {
     };
     private void Update()
     {
+        if (singlePattern != null && singlePattern.IsDrawing) return;
         if (Input.GetKeyDown(KeyCode.V))
         {
             ToggleComparisonMode();
@@ -250,22 +262,45 @@ public class StarField : MonoBehaviour {
     {
         if (comparison == null || !comparison.IsReady || !comparison.isActiveAndEnabled ||
             IsComparisonActive || chineseAsterisms == null || !chineseAsterisms.isActiveAndEnabled) return;
+        if (singlePattern != null && singlePattern.IsDrawing) return;
+        if (singlePattern != null) singlePattern.ClearSelection();
+        SuspendBrowseFigures(false);
+        comparison.EnterComparison();
+    }
+
+    internal void SuspendBrowseFigures(bool resetWesternColours)
+    {
         savedChineseRegion = chineseAsterisms.SelectedRegionId;
         savedChineseVisible = chineseAsterisms.ActiveRegionId != null;
         savedWesternVisibility.Clear();
         foreach (var entry in constellationVisible)
         {
             savedWesternVisibility.Add(entry.Key, entry.Value.activeSelf);
+            if (resetWesternColours && entry.Value.activeSelf)
+                foreach (int hr in constellations[entry.Key].Item1)
+                {
+                    if (savedBrowseColours.ContainsKey(hr)) continue;
+                    var material = starObjects[hr - 1].GetComponent<MeshRenderer>().sharedMaterial;
+                    savedBrowseColours.Add(hr, material.color);
+                    material.color = stars[hr - 1].colour;
+                }
             entry.Value.SetActive(false);
         }
         chineseAsterisms.HideRegion();
-        comparison.EnterComparison();
     }
 
     public void ExitComparisonMode()
     {
         if (!IsComparisonActive) return;
         comparison.ExitComparison();
+        RestoreBrowseFigures();
+    }
+
+    internal void RestoreBrowseFigures()
+    {
+        foreach (var entry in savedBrowseColours)
+            starObjects[entry.Key - 1].GetComponent<MeshRenderer>().sharedMaterial.color = entry.Value;
+        savedBrowseColours.Clear();
         foreach (var entry in savedWesternVisibility)
             if (constellationVisible.TryGetValue(entry.Key, out var holder) && holder != null)
                 holder.SetActive(entry.Value);
@@ -273,9 +308,13 @@ public class StarField : MonoBehaviour {
         chineseAsterisms.SelectRegion(savedChineseRegion, savedChineseVisible);
     }
 
-    private void OnDisable() { ExitComparisonMode(); }
+    private void OnDisable()
+    {
+        if (singlePattern != null && singlePattern.IsDrawing) singlePattern.ExitDrawing();
+        ExitComparisonMode();
+    }
 
-    private void SwitchSkyCulture()
+    public void SwitchSkyCulture()
     {
         if (IsComparisonActive) { comparison.SwitchCulture(); return; }
         if (!chineseMode)
@@ -296,7 +335,7 @@ public class StarField : MonoBehaviour {
         }
     }
 
-    private void ToggleBothCultures()
+    public void ToggleBothCultures()
     {
         if (IsComparisonActive) { comparison.ToggleBoth(); return; }
         if (showBoth)
@@ -395,7 +434,7 @@ public class StarField : MonoBehaviour {
     }
 
 
-    void ToggleConstellation(int index) {
+    public void ToggleConstellation(int index) {
     // Safety check the index is valid.
     if ((index < 0) || (index >= constellations.Count)) {
       return;

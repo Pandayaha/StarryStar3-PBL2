@@ -6,6 +6,7 @@ using UnityEngine.XR;
 using Valve.VR;
 
 // SteamVR pointing and a world-space menu. Desktop clicks use the same pointer path.
+[DefaultExecutionOrder(-100)]
 public class SkyPracticeVrControls : MonoBehaviour
 {
     private sealed class MenuButton
@@ -27,24 +28,42 @@ public class SkyPracticeVrControls : MonoBehaviour
     private SkyCultureComparisonController comparison;
     private StarField field;
     private ChineseAsterismController chinese;
+    private SinglePatternPractice single;
     private Camera viewCamera;
     private SteamVR_Behaviour_Pose rightPose;
-    private SteamVR_Action_Boolean confirmAction;
+    private SteamVR_Action_Boolean confirmAction, menuAction;
     private GameObject interfaceRoot;
     private RectTransform panel, aboutViewport, aboutContent;
     private BoxCollider panelCollider;
-    private Text titleLabel, statusLabel, inputLabel, aboutLabel;
+    private RectTransform selectionCard;
+    private BoxCollider selectionBackground;
+    private MenuButton detailsButton, previousCandidate, nextCandidate, drawSelected, backToSky;
+    private Text selectedTitle, selectedSummary, selectedDescription;
+    private bool detailsOpen;
+    private int cardSide = 1;
+    private string displayedCardId, displayedTagId;
+    private int displayedCandidateCount, displayedCandidateIndex;
+    private Text titleLabel, statusLabel, inputLabel, aboutLabel, trackingNoticeLabel;
     private MenuButton openButton;
     private ScrollRect aboutScroll;
     private LineRenderer pointerLine, hoverRing;
     private Material pointerMaterial;
     private Font font;
-    private bool aboutOpen, drawingChoicesOpen, panelOpen = true, legacySuspended, wasPracticing, wasInterfaceVisible;
+    private bool aboutOpen, drawingChoicesOpen, panelOpen, legacySuspended, wasPracticing, wasComparisonActive;
+    private int westernPatternIndex;
+    private int suppressLegacyThroughFrame = -1;
+    private bool consumedTriggerHeld;
+    private float nextPoseSearchTime;
+    private string trackingHint = string.Empty;
+    private float rightPoseLostAt = -1f, trackingNoticeEndsAt;
+    private bool trackingNoticeShown;
 
     public bool UsingHeadset => XRSettings.isDeviceActive || (viewCamera != null && viewCamera.stereoEnabled);
     public int HoveredStarHr { get; private set; }
     public string HoveredButtonName { get; private set; }
     public Vector3 PointerEndPoint { get; private set; }
+    public bool IsMenuOpen => panelOpen;
+    private bool DrawingIndividual => single != null && single.IsDrawing;
 
     public void Initialize(SkyCultureComparisonController controller)
     {
@@ -52,39 +71,47 @@ public class SkyPracticeVrControls : MonoBehaviour
         comparison = controller;
         field = controller.GetComponent<StarField>();
         chinese = controller.GetComponent<ChineseAsterismController>();
-        viewCamera = Camera.main;
-        if (viewCamera != null) BuildInterface();
-        SyncLegacyDrawing();
+        single = controller.GetComponent<SinglePatternPractice>();
+        RefreshCamera();
         RefreshInterface();
+        SyncLegacyDrawing();
     }
 
     private void Update()
     {
         if (comparison == null || !comparison.IsReady) return;
-        if (viewCamera == null)
-        {
-            viewCamera = Camera.main;
-            if (viewCamera == null) return;
-        }
-        if (interfaceRoot == null) BuildInterface();
-        SyncLegacyDrawing();
-        RefreshInterface();
-
+        if (!RefreshCamera()) return;
         // Checking Unity XR first avoids initializing SteamVR on a desktop-only preview.
         if (UsingHeadset)
         {
-            if (rightPose == null || !rightPose.isActiveAndEnabled)
-                foreach (var pose in FindObjectsOfType<SteamVR_Behaviour_Pose>(true))
-                    if (pose.inputSource == SteamVR_Input_Sources.RightHand && pose.isActiveAndEnabled)
-                    {
-                        rightPose = pose;
-                        break;
-                    }
-            if (rightPose != null && rightPose.isActiveAndEnabled && rightPose.poseAction != null && rightPose.isActive && rightPose.isValid)
+            RefreshControllerPoses();
+            if (menuAction == null) menuAction = SteamVR_Actions.default_GrabGrip;
+            if (confirmAction == null) confirmAction = SteamVR_Actions.default_GrabPinch;
+            if (!PoseReady(rightPose)) trackingHint = "Right controller not tracked. Check SteamVR. M: menu.";
+            else if (confirmAction == null || !confirmAction.GetActive(SteamVR_Input_Sources.RightHand))
+                trackingHint = "Right confirm inactive. Check SteamVR bindings.";
+            else if (menuAction == null || !menuAction.GetActive(SteamVR_Input_Sources.LeftHand))
+                trackingHint = "Left menu action inactive. Check binding; M also works.";
+            else trackingHint = string.Empty;
+        }
+        else trackingHint = string.Empty;
+
+        // Grip/M wins over confirmation, including on the frame the menu closes.
+        if (Input.GetKeyDown(KeyCode.M) || (UsingHeadset && menuAction != null &&
+            menuAction.GetActive(SteamVR_Input_Sources.LeftHand) && menuAction.GetStateDown(SteamVR_Input_Sources.LeftHand)))
+        {
+            ToggleMenu();
+            return;
+        }
+        RefreshInterface();
+        RefreshTrackingNotice(UsingHeadset, UsingHeadset && PoseReady(rightPose));
+        SyncLegacyDrawing();
+        if (UsingHeadset)
+        {
+            if (PoseReady(rightPose))
             {
-                if (confirmAction == null) confirmAction = SteamVR_Actions.default_GrabPinch;
                 ProcessPointer(new Ray(rightPose.transform.position, rightPose.transform.forward),
-                    confirmAction != null && confirmAction.GetStateDown(rightPose.inputSource));
+                    confirmAction != null && confirmAction.GetStateDown(SteamVR_Input_Sources.RightHand));
             }
             else HidePointer();
         }
@@ -92,6 +119,90 @@ public class SkyPracticeVrControls : MonoBehaviour
         {
             ProcessPointer(viewCamera.ScreenPointToRay(Input.mousePosition), Input.GetMouseButtonDown(0));
         }
+    }
+
+    private bool RefreshCamera()
+    {
+        var current = Camera.main;
+        if (current == null || !current.isActiveAndEnabled)
+        {
+            HidePointer();
+            return false;
+        }
+        if (viewCamera != current)
+        {
+            viewCamera = current;
+            rightPose = null;
+            nextPoseSearchTime = 0f;
+            if (interfaceRoot != null)
+            {
+                interfaceRoot.transform.SetParent(viewCamera.transform, false);
+                foreach (var canvas in interfaceRoot.GetComponentsInChildren<Canvas>(true)) canvas.worldCamera = viewCamera;
+            }
+        }
+        if (interfaceRoot == null)
+        {
+            buttons.Clear();
+            if (pointerMaterial != null) Destroy(pointerMaterial);
+            BuildInterface();
+        }
+        return true;
+    }
+
+    private static bool PoseReady(SteamVR_Behaviour_Pose pose)
+    {
+        return pose != null && pose.isActiveAndEnabled && pose.poseAction != null && pose.isActive && pose.isValid;
+    }
+
+    private void RefreshControllerPoses()
+    {
+        if (PoseReady(rightPose)) return;
+        if (Time.unscaledTime < nextPoseSearchTime) return;
+        nextPoseSearchTime = Time.unscaledTime + 0.5f;
+        rightPose = null;
+        foreach (var pose in FindObjectsOfType<SteamVR_Behaviour_Pose>(true))
+        {
+            if (pose.inputSource != SteamVR_Input_Sources.RightHand || !PoseReady(pose)) continue;
+            rightPose = pose;
+            break;
+        }
+    }
+
+    private void RefreshTrackingNotice(bool headsetActive, bool rightTracked)
+    {
+        if (trackingNoticeLabel == null) return;
+        float now = Time.unscaledTime;
+        if (!headsetActive || rightTracked)
+        {
+            rightPoseLostAt = -1f;
+            trackingNoticeEndsAt = 0f;
+            trackingNoticeShown = false;
+        }
+        else
+        {
+            if (rightPoseLostAt < 0f) rightPoseLostAt = now;
+            if (panelOpen) trackingNoticeEndsAt = 0f;
+            else if (!trackingNoticeShown && now - rightPoseLostAt >= 0.75f)
+            {
+                trackingNoticeShown = true;
+                trackingNoticeEndsAt = now + 4f;
+            }
+        }
+        trackingNoticeLabel.transform.parent.gameObject.SetActive(
+            headsetActive && !rightTracked && !panelOpen && now < trackingNoticeEndsAt);
+    }
+
+    public void ToggleMenu()
+    {
+        if (!isActiveAndEnabled || comparison == null || !comparison.IsReady || !RefreshCamera()) return;
+        SyncComparisonMenuState();
+        panelOpen = !panelOpen;
+        if (panelOpen) detailsOpen = false;
+        if (!panelOpen) aboutOpen = drawingChoicesOpen = false;
+        HidePointer();
+        ConsumePointerPress();
+        RefreshInterface();
+        RefreshTrackingNotice(UsingHeadset, UsingHeadset && PoseReady(rightPose));
     }
 
     public void ProcessPointer(Ray ray, bool confirm)
@@ -114,8 +225,8 @@ public class SkyPracticeVrControls : MonoBehaviour
                 endpoint = ray.GetPoint(distance);
                 blockedByPanel = true;
             }
-        if (panelCollider.enabled && panelCollider.gameObject.activeInHierarchy && TryHitRectangle(ray, panelCollider, out float backgroundDistance) &&
-            backgroundDistance < nearest - 0.0001f)
+        if (BackgroundBlocks(ray, panelCollider, nearest, out float backgroundDistance) ||
+            BackgroundBlocks(ray, selectionBackground, nearest, out backgroundDistance))
         {
             hovered = null;
             endpoint = ray.GetPoint(backgroundDistance);
@@ -125,14 +236,16 @@ public class SkyPracticeVrControls : MonoBehaviour
         foreach (var button in buttons)
             button.Image.color = !button.Enabled ? new Color(0.08f, 0.1f, 0.14f, 1f) :
                 button == hovered ? hoverColour : buttonColour;
+        bool hoverIndividualStar = false;
         if (hovered != null)
         {
             HoveredButtonName = hovered.Name;
             if (confirm && hovered.Enabled)
             {
                 hovered.Click();
-                SyncLegacyDrawing();
+                ConsumePointerPress();
                 RefreshInterface();
+                RefreshTrackingNotice(UsingHeadset, UsingHeadset && PoseReady(rightPose));
             }
         }
         else if (!blockedByPanel)
@@ -143,6 +256,38 @@ public class SkyPracticeVrControls : MonoBehaviour
                 endpoint = position;
                 if (confirm) comparison.SelectPracticeStar(hr);
             }
+            else if (!comparison.IsActive && single != null)
+            {
+                Transform star;
+                if (single.IsDrawing)
+                {
+                    if (single.TryPickDrawingStar(ray, out star))
+                    {
+                        hoverIndividualStar = true;
+                        endpoint = star.position;
+                        if (confirm) single.SelectDrawingStar(star);
+                    }
+                }
+                else if (single.TryPickBrowseStar(ray, out star))
+                {
+                    hoverIndividualStar = true;
+                    endpoint = star.position;
+                    if (confirm && single.SelectBrowseStar(star))
+                    {
+                        cardSide = viewCamera.WorldToViewportPoint(single.SelectedCentre).x > 0.5f ? -1 : 1;
+                        detailsOpen = false;
+                        ConsumePointerPress();
+                        RefreshInterface();
+                    }
+                }
+                else if (confirm && !panelOpen && single.HasSelection)
+                {
+                    detailsOpen = false;
+                    single.ClearSelection();
+                    ConsumePointerPress();
+                    RefreshInterface();
+                }
+            }
             else if (!comparison.IsActive && confirm && chinese != null)
                 chinese.TryFocus(ray);
         }
@@ -151,8 +296,15 @@ public class SkyPracticeVrControls : MonoBehaviour
         pointerLine.enabled = UsingHeadset;
         pointerLine.SetPosition(0, ray.origin);
         pointerLine.SetPosition(1, endpoint);
-        hoverRing.enabled = HoveredStarHr > 0;
-        if (HoveredStarHr > 0) SetHoverRing(endpoint, ray.origin);
+        hoverRing.enabled = HoveredStarHr > 0 || hoverIndividualStar;
+        if (hoverRing.enabled) SetHoverRing(endpoint, ray.origin);
+    }
+
+    private static bool BackgroundBlocks(Ray ray, BoxCollider box, float buttonDistance, out float distance)
+    {
+        distance = 0f;
+        return box != null && box.enabled && box.gameObject.activeInHierarchy &&
+            TryHitRectangle(ray, box, out distance) && distance < buttonDistance - 0.0001f;
     }
 
     // The collider's local rectangle is also the hit target. No global physics sync is
@@ -189,13 +341,25 @@ public class SkyPracticeVrControls : MonoBehaviour
                 () => StartDrawing(SkyCultureComparisonController.DrawingMode.Western),
                 () => StartDrawing(SkyCultureComparisonController.DrawingMode.Both) });
         Row(134f, new[] { "CancelSelection", "Undo", "Reset" }, new[] { "Cancel start", "Undo line", "Restart drawing" },
-            new Action[] { () => comparison.CancelPracticeSelection(), () => comparison.UndoPracticeLine(), () => comparison.ResetPractice() });
+            new Action[] { () => { if (DrawingIndividual) single.CancelStart(); else comparison.CancelPracticeSelection(); },
+                () => { if (DrawingIndividual) single.Undo(); else comparison.UndoPracticeLine(); },
+                () => { if (DrawingIndividual) single.Restart(); else comparison.ResetPractice(); } });
         Row(174f, new[] { "Advance", "Answer" }, new[] { "Finish drawing", "Show answer" },
-            new Action[] { () => comparison.AdvancePractice(), ToggleAnswer });
+            new Action[] { () => { if (DrawingIndividual) single.Finish(); else comparison.AdvancePractice(); }, ToggleAnswer });
         Row(214f, new[] { "BackToObserve", "About", "HidePanel" }, new[] { "Back to observe", "About this case", "Hide panel" },
-            new Action[] { () => comparison.StopPractice(), () => { aboutOpen = !aboutOpen; if (aboutOpen) drawingChoicesOpen = false; }, () => { panelOpen = false; } });
+            new Action[] { BackToObserve, () => { aboutOpen = !aboutOpen; if (aboutOpen) drawingChoicesOpen = false; }, () => { panelOpen = false; } });
         MakeButton(panel, "StartDrawing", "Start drawing", new Rect(16f, 214f, (ContentWidth - 24f) / 3f, 36f),
             () => { drawingChoicesOpen = !drawingChoicesOpen; aboutOpen = false; });
+        Row(134f, new[] { "BrowseCulture", "BrowseBoth" }, new[] { "Chinese / Western", "Show both cultures" },
+            new Action[] { () => field.SwitchSkyCulture(), () => field.ToggleBothCultures() });
+        Row(174f, new[] { "WesternPrevious", "WesternToggle", "WesternNext" }, new[] { "< Western", "Show", "Western >" },
+            new Action[] { () => SelectWesternPattern(-1), () => field.ToggleConstellation(westernPatternIndex), () => SelectWesternPattern(1) });
+        Row(214f, new[] { "RegionPrevious", "RegionToggle", "RegionNext" }, new[] { "< Region", "Show Chinese", "Region >" },
+            new Action[] { () => chinese.SelectNextRegion(-1), () => chinese.ToggleSelectedRegion(), () => chinese.SelectNextRegion(1) });
+        Row(254f, new[] { "FocusPrevious", "FocusNext" }, new[] { "< Asterism", "Asterism >" },
+            new Action[] { () => chinese.SelectNextAsterism(-1), () => chinese.SelectNextAsterism(1) });
+        Row(294f, new[] { "EnterComparison", "BrowseClose" }, new[] { "Compare / Draw", "Close menu" },
+            new Action[] { () => field.EnterComparisonMode(), () => { panelOpen = false; } });
 
         aboutViewport = MakeRect(panel, "AboutViewport", new Rect(16f, 264f, ContentWidth, 210f));
         aboutViewport.gameObject.AddComponent<Image>().color = new Color(0.05f, 0.075f, 0.12f, 1f);
@@ -215,12 +379,116 @@ public class SkyPracticeVrControls : MonoBehaviour
 
         var tab = MakeCanvas("SkyPracticeMenuTab", new Vector2(250f, 46f), new Vector3(-0.8f, -0.95f, 2.2f));
         openButton = MakeButton(tab, "OpenPanel", "Open menu", new Rect(0f, 0f, 250f, 46f), () => { panelOpen = true; });
+        BuildSelectionCard();
+        var notice = MakeCanvas("SkyPracticeTrackingNotice", new Vector2(PanelWidth, 30f), new Vector3(-0.8f, -1.07f, 2.2f));
+        trackingNoticeLabel = MakeText(notice, "ControllerTrackingNotice", 0f, 0f, PanelWidth, 30f, 17);
+        trackingNoticeLabel.text = "Right controller not tracked. Check SteamVR.";
+        trackingNoticeLabel.color = new Color(1f, 199f / 255f, 107f / 255f);
+        trackingNoticeLabel.horizontalOverflow = HorizontalWrapMode.Overflow;
+        notice.gameObject.SetActive(false);
         var shader = Resources.Load<Shader>("ChineseAsterismLine");
         pointerMaterial = new Material(shader != null ? shader : Shader.Find("Sprites/Default"));
         pointerLine = MakePointerLine("PracticeControllerRay", 0.006f, new Color(0.45f, 1f, 0.85f, 1f), 2);
         hoverRing = MakePointerLine("PracticeHoveredStar", 0.22f, new Color(0.45f, 1f, 0.85f, 1f), 32);
         hoverRing.loop = true;
         HidePointer();
+    }
+
+    private void BuildSelectionCard()
+    {
+        displayedCardId = displayedTagId = null;
+        var tag = MakeCanvas("SinglePatternTag", new Vector2(320f, 46f), Vector3.zero);
+        detailsButton = MakeButton(tag, "SingleDetails", "Details", new Rect(0f, 0f, 320f, 46f),
+            () => { detailsOpen = true; });
+        const float width = 454f;
+        selectionCard = MakeCanvas("SinglePatternCard", new Vector2(width, 220f), Vector3.zero);
+        selectionCard.gameObject.AddComponent<Image>().color = new Color(0.025f, 0.045f, 0.08f, 0.96f);
+        selectionBackground = selectionCard.gameObject.AddComponent<BoxCollider>();
+        selectionBackground.center = new Vector3(0f, 0f, 2f);
+        selectedTitle = MakeText(selectionCard, "SingleTitle", 16f, 10f, width - 32f, 34f, 23);
+        selectedSummary = MakeText(selectionCard, "SingleSummary", 16f, 48f, width - 32f, 30f, 17);
+        selectedDescription = MakeText(selectionCard, "SingleDescription", 16f, 84f, width - 32f, 90f, 19);
+        const float half = (width - 44f) / 2f;
+        previousCandidate = MakeButton(selectionCard, "SinglePrevious", "< Pattern", new Rect(16f, 0f, half, 40f), () => single.CycleCandidate(-1));
+        nextCandidate = MakeButton(selectionCard, "SingleNext", "Pattern >", new Rect(28f + half, 0f, half, 40f), () => single.CycleCandidate(1));
+        drawSelected = MakeButton(selectionCard, "SingleStart", "Draw this pattern", new Rect(16f, 0f, half, 42f),
+            () => { if (single.StartDrawing()) { detailsOpen = false; panelOpen = false; } });
+        backToSky = MakeButton(selectionCard, "SingleBack", "Back to sky", new Rect(28f + half, 0f, half, 42f),
+            () => { detailsOpen = false; });
+        tag.gameObject.SetActive(false);
+        selectionCard.gameObject.SetActive(false);
+    }
+
+    private void RefreshSelectionCard(bool browsing)
+    {
+        bool selected = browsing && single != null && single.HasSelection;
+        if (!selected) detailsOpen = false;
+        bool show = selected && !panelOpen;
+        var tag = (RectTransform)detailsButton.Collider.transform.parent;
+        tag.gameObject.SetActive(show && !detailsOpen);
+        selectionCard.gameObject.SetActive(show && detailsOpen);
+        if (!show) return;
+        if (!detailsOpen)
+        {
+            if (displayedTagId != single.SelectedId)
+            {
+                displayedTagId = single.SelectedId;
+                detailsButton.Label.text = single.SelectedName + "   ·   Details";
+            }
+            PositionBesideSky(tag);
+            return;
+        }
+        if (displayedCardId == single.SelectedId && displayedCandidateCount == single.CandidateCount &&
+            displayedCandidateIndex == single.CandidateIndex)
+        {
+            PositionBesideSky(selectionCard);
+            return;
+        }
+        displayedCardId = single.SelectedId;
+        displayedCandidateCount = single.CandidateCount;
+        displayedCandidateIndex = single.CandidateIndex;
+        selectedTitle.text = single.SelectedName;
+        bool shared = single.CandidateCount > 1;
+        selectedSummary.text = single.CultureLabel + (single.CanDraw
+            ? $"  ·  {single.MemberCount} stars  ·  {single.LineCount} {(single.LineCount == 1 ? "line" : "lines")}"
+            : "  ·  Single star  ·  Observation only");
+        selectedSummary.color = single.SelectedIsChinese ? new Color(1f, 0.8f, 0.43f) : new Color(0.57f, 0.8f, 1f);
+        selectedDescription.text = SinglePatternDescriptions.Get(single.SelectedId);
+        float bodyHeight = Mathf.Max(48f, selectedDescription.preferredHeight + 5f);
+        selectedDescription.rectTransform.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, bodyHeight);
+        float row = 84f + bodyHeight + 10f;
+        previousCandidate.Collider.gameObject.SetActive(shared);
+        nextCandidate.Collider.gameObject.SetActive(shared);
+        if (shared)
+        {
+            SetButtonTop(previousCandidate, row);
+            SetButtonTop(nextCandidate, row);
+            nextCandidate.Label.text = $"Pattern {single.CandidateIndex + 1}/{single.CandidateCount}  >";
+            row += 48f;
+        }
+        drawSelected.Collider.gameObject.SetActive(single.CanDraw);
+        SetButtonTop(drawSelected, row);
+        SetButtonTop(backToSky, row);
+        selectionCard.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, row + 54f);
+        selectionBackground.size = new Vector3(selectionCard.rect.width, selectionCard.rect.height, 0.1f);
+        PositionBesideSky(selectionCard);
+    }
+
+    private static void SetButtonTop(MenuButton button, float top)
+    {
+        var rect = (RectTransform)button.Collider.transform;
+        rect.anchoredPosition = new Vector2(rect.anchoredPosition.x, -top);
+    }
+
+    private void PositionBesideSky(RectTransform rect)
+    {
+        const float distance = 2.2f;
+        var corner = viewCamera.transform.InverseTransformPoint(viewCamera.ViewportToWorldPoint(new Vector3(0.96f, 0.94f, distance)));
+        float scale = Mathf.Min(0.002f, Mathf.Abs(corner.x) * 2f / rect.rect.width, Mathf.Abs(corner.y) * 2f / rect.rect.height);
+        rect.localScale = Vector3.one * scale;
+        float offsetX = Mathf.Clamp(Mathf.Abs(corner.x) - rect.rect.width * scale * 0.5f, 0f, 0.95f);
+        float offsetY = Mathf.Clamp(Mathf.Abs(corner.y) - rect.rect.height * scale * 0.5f, 0f, 0.25f);
+        rect.localPosition = new Vector3(cardSide * offsetX, -offsetY, distance);
     }
 
     private RectTransform MakeCanvas(string name, Vector2 size, Vector3 position)
@@ -283,28 +551,40 @@ public class SkyPracticeVrControls : MonoBehaviour
             MakeButton(panel, names[i], labels[i], new Rect(16f + i * (width + 12f), y, width, 36f), actions[i]);
     }
 
+    private void SyncComparisonMenuState()
+    {
+        if (comparison.IsActive == wasComparisonActive) return;
+        wasComparisonActive = comparison.IsActive;
+        panelOpen = comparison.IsActive && !comparison.IsPracticing;
+        aboutOpen = drawingChoicesOpen = false;
+    }
+
     private void RefreshInterface()
     {
         if (interfaceRoot == null || comparison == null) return;
+        SyncComparisonMenuState();
+        if (single != null) single.RefreshSelection();
         bool active = comparison.IsActive, practicing = comparison.IsPracticing;
-        bool showInterface = active;
-        if (showInterface && !wasInterfaceVisible)
-        {
-            panelOpen = !practicing;
-            aboutOpen = drawingChoicesOpen = false;
-        }
-        wasInterfaceVisible = showInterface;
+        bool individual = DrawingIndividual;
+        RefreshSelectionCard(!active && !individual);
+        bool showInterface = active || individual || panelOpen;
         if (practicing && !wasPracticing) aboutOpen = false;
         wasPracticing = practicing;
         panel.gameObject.SetActive(showInterface && panelOpen);
-        openButton.Collider.transform.parent.gameObject.SetActive(showInterface && !panelOpen);
+        openButton.Collider.transform.parent.gameObject.SetActive((active || individual) && !panelOpen);
         if (!showInterface)
         {
             aboutOpen = drawingChoicesOpen = false;
-            HidePointer();
+            if (single == null || !single.HasSelection) HidePointer();
             return;
         }
-        titleLabel.text = $"[{comparison.CaseIndex + 1}/{comparison.CaseCount}] {comparison.ChineseName} / {comparison.WesternName}";
+        if (individual)
+        {
+            RefreshIndividualMenu();
+            return;
+        }
+        titleLabel.text = active ? $"[{comparison.CaseIndex + 1}/{comparison.CaseCount}] {comparison.ChineseName} / {comparison.WesternName}" :
+            "Sky browser / " + (field != null && field.BrowseChineseAvailable ? field.BrowseWesternAvailable ? "Both" : "Chinese" : "Western");
         string practiceHeading;
         if (comparison.PracticePhase == SkyCultureComparisonController.DrawingPhase.Review)
             practiceHeading = comparison.PracticeAnswerVisible ? "Standard answer | Magenta: shared connections" :
@@ -317,6 +597,14 @@ public class SkyPracticeVrControls : MonoBehaviour
                 "Draw Chinese | Western reference" : "Draw Western | Chinese reference";
         statusLabel.text = practicing ? practiceHeading + $"\nYour lines: Chinese {comparison.PracticeChineseLineCount} | Western {comparison.PracticeWesternLineCount}" :
             $"Observe: {comparison.CurrentView} | Rings: shared stars\nGold: Chinese | Blue: Western | Magenta: shared lines";
+        if (!active && field != null)
+        {
+            string westernState = !field.BrowseWesternAvailable ? "not in this view" :
+                field.IsWesternPatternVisible(westernPatternIndex) ? "shown" : "hidden";
+            string regionName = chinese != null ? chinese.SelectedRegionNameEn?.Replace(" (Selection)", string.Empty) ?? "Unavailable" : "Unavailable";
+            statusLabel.text = $"Western [{westernPatternIndex + 1}/{field.WesternPatternCount}]: {field.GetWesternPatternName(westernPatternIndex)} ({westernState})\n" +
+                $"Chinese [{(chinese != null ? chinese.SelectedRegionIndex + 1 : 0)}/{(chinese != null ? chinese.RegionCount : 0)}]: {regionName}";
+        }
         bool showFeedback = practicing && !comparison.PracticeAnswerVisible &&
             !string.IsNullOrEmpty(comparison.PracticeFeedbackText);
         Color feedbackColour = comparison.PracticeFeedbackCorrect ? new Color(110f / 255f, 1f, 154f / 255f) :
@@ -328,7 +616,10 @@ public class SkyPracticeVrControls : MonoBehaviour
         }
         inputLabel.text = practicing ? (UsingHeadset ? "Right hand: point and confirm two outlined stars to connect." :
             "Click two outlined stars to connect. Right-drag to look.") :
-            "Choose Start drawing to draw Chinese, Western, or both.";
+            active ? "Choose Start drawing to draw Chinese, Western, or both." :
+                chinese != null && chinese.IsRegionVisible ? "Focus: " + chinese.FocusedAsterismNameEn + " | Left grip / M: menu" :
+                "Choose a pattern, then Show / Hide. Left grip / M: menu.";
+        if (!string.IsNullOrEmpty(trackingHint)) inputLabel.text = trackingHint;
         openButton.Label.text = practicing ? (comparison.PracticePhase == SkyCultureComparisonController.DrawingPhase.Western ? "Western | Open menu" :
             comparison.PracticePhase == SkyCultureComparisonController.DrawingPhase.Chinese ? "Chinese | Open menu" : "Review | Open menu") : "Open menu";
         if (showFeedback) openButton.Label.text = comparison.PracticeFeedbackCorrect ? "Correct! | Open menu" : "Try again | Open menu";
@@ -336,13 +627,21 @@ public class SkyPracticeVrControls : MonoBehaviour
 
         foreach (var button in buttons)
         {
-            if (button == openButton) continue;
+            if (button.Collider.transform.parent != panel) continue;
             bool visible = active;
             bool enabled = true;
             switch (button.Name)
             {
                 case "PreviousCase": case "NextCase": case "ExitComparison":
                 case "SwitchCulture": case "BothViews": case "StartDrawing": visible = active && !practicing; break;
+                case "BrowseCulture": case "BrowseBoth": case "EnterComparison": case "BrowseClose":
+                    visible = !active; enabled = field != null; break;
+                case "WesternPrevious": case "WesternToggle": case "WesternNext":
+                    visible = !active; enabled = field != null && field.BrowseWesternAvailable; break;
+                case "RegionPrevious": case "RegionToggle": case "RegionNext":
+                    visible = !active; enabled = field != null && field.BrowseChineseAvailable && chinese != null; break;
+                case "FocusPrevious": case "FocusNext":
+                    visible = !active; enabled = field != null && field.BrowseChineseAvailable && chinese != null && chinese.IsRegionVisible; break;
                 case "DrawChinese": case "DrawWestern": case "DrawBoth": visible = active && !practicing && drawingChoicesOpen; break;
                 case "CancelSelection": visible = active && practicing; enabled = comparison.PracticeSelectedHr != 0; break;
                 case "Undo": visible = active && practicing; enabled = comparison.PracticePhase != SkyCultureComparisonController.DrawingPhase.Review; break;
@@ -350,18 +649,20 @@ public class SkyPracticeVrControls : MonoBehaviour
                 case "Advance": visible = active && practicing; enabled = comparison.PracticePhase != SkyCultureComparisonController.DrawingPhase.Review; break;
                 case "AboutUp": case "AboutDown": visible = active && aboutOpen; break;
             }
-            button.Collider.gameObject.SetActive(visible);
-            button.Enabled = enabled;
-            button.Label.color = enabled ? Color.white : new Color(0.5f, 0.54f, 0.6f, 1f);
+            SetMenuButton(button, visible, enabled);
+            if (button.Name == "BackToObserve") button.Label.text = "Back to observe";
             if (button.Name == "Answer") button.Label.text = comparison.PracticeAnswerVisible ? "Your drawing" : "Show answer";
             if (button.Name == "About") button.Label.text = aboutOpen ? "Close introduction" : "About this case";
             if (button.Name == "StartDrawing") button.Label.text = drawingChoicesOpen ? "Close choices" : "Start drawing";
+            if (button.Name == "BrowseBoth") button.Label.text = field != null && field.IsBothCulturesVisible ? "Return to one culture" : "Show both cultures";
+            if (button.Name == "WesternToggle") button.Label.text = field != null && field.IsWesternPatternVisible(westernPatternIndex) ? "Hide" : "Show";
+            if (button.Name == "RegionToggle") button.Label.text = chinese != null && chinese.IsRegionVisible ? "Hide Chinese" : "Show Chinese";
             if (button.Name == "Advance") button.Label.text = comparison.PracticeMode == SkyCultureComparisonController.DrawingMode.Both &&
                 comparison.PracticePhase == SkyCultureComparisonController.DrawingPhase.Chinese ? "Check Chinese / Next" : "Finish / Check drawing";
         }
         bool showAbout = active && aboutOpen;
         aboutViewport.gameObject.SetActive(showAbout);
-        float height = showAbout ? 526f : drawingChoicesOpen && !practicing ? 298f : 258f;
+        float height = !active ? 338f : showAbout ? 526f : drawingChoicesOpen && !practicing ? 298f : 258f;
         panel.sizeDelta = new Vector2(PanelWidth, height);
         panelCollider.size = new Vector3(PanelWidth, height, 0.1f);
         if (showAbout && aboutLabel.text != comparison.CaseAboutText)
@@ -372,6 +673,56 @@ public class SkyPracticeVrControls : MonoBehaviour
             aboutContent.sizeDelta = new Vector2(ContentWidth - 20f, contentHeight);
             aboutScroll.verticalNormalizedPosition = 1f;
         }
+    }
+
+    private static void SetMenuButton(MenuButton button, bool visible, bool enabled)
+    {
+        button.Collider.gameObject.SetActive(visible);
+        button.Enabled = enabled;
+        button.Label.color = enabled ? Color.white : new Color(0.5f, 0.54f, 0.6f, 1f);
+    }
+
+    private void RefreshIndividualMenu()
+    {
+        titleLabel.text = single.SelectedName;
+        string progress = $"{single.CultureLabel}  ·  Your lines: {single.DrawnLineCount}";
+        bool feedback = !single.AnswerVisible && !string.IsNullOrEmpty(single.Feedback);
+        if (feedback)
+        {
+            string colour = single.FeedbackCorrect ? "#6EFF9A" : "#FFC76B";
+            statusLabel.text = $"<color={colour}>{single.Feedback}</color>\n{progress}";
+        }
+        else statusLabel.text = (single.AnswerVisible ? "Standard answer" : "Draw this pattern") + "\n" + progress;
+        inputLabel.text = !string.IsNullOrEmpty(trackingHint) ? trackingHint :
+            single.AnswerVisible ? "Choose Your drawing to continue." :
+            UsingHeadset ? "Point at two outlined stars and press the right trigger on each." : "Click two outlined stars to connect. Right-drag to look.";
+        openButton.Label.text = feedback ? (single.FeedbackCorrect ? "Correct! | Open menu" : "Try again | Open menu") : "Drawing | Open menu";
+        openButton.Label.color = feedback ? (single.FeedbackCorrect ? new Color(0.43f, 1f, 0.6f) : new Color(1f, 0.78f, 0.42f)) : Color.white;
+        aboutViewport.gameObject.SetActive(false);
+        panel.sizeDelta = new Vector2(PanelWidth, 258f);
+        panelCollider.size = new Vector3(PanelWidth, 258f, 0.1f);
+        foreach (var button in buttons)
+        {
+            if (button.Collider.transform.parent != panel) continue;
+            bool enabled = true;
+            switch (button.Name)
+            {
+                case "CancelSelection": enabled = !single.AnswerVisible && single.HasPendingStart; break;
+                case "Undo": enabled = !single.AnswerVisible && (single.DrawnLineCount > 0 || single.HasPendingStart); break;
+                case "Advance": button.Label.text = "Finish / Check drawing"; enabled = !single.AnswerVisible; break;
+                case "Answer": button.Label.text = single.AnswerVisible ? "Your drawing" : "Show answer"; break;
+                case "BackToObserve": button.Label.text = "Back to sky"; break;
+                case "Reset": case "HidePanel": break;
+                default: SetMenuButton(button, false, false); continue;
+            }
+            SetMenuButton(button, true, enabled);
+        }
+    }
+
+    private void SelectWesternPattern(int direction)
+    {
+        if (field == null || field.WesternPatternCount == 0) return;
+        westernPatternIndex = (westernPatternIndex + direction + field.WesternPatternCount) % field.WesternPatternCount;
     }
 
     private void StartDrawing(SkyCultureComparisonController.DrawingMode mode)
@@ -385,19 +736,41 @@ public class SkyPracticeVrControls : MonoBehaviour
     private void ExitComparison()
     {
         if (field != null) field.ExitComparisonMode();
+        panelOpen = false;
         aboutOpen = drawingChoicesOpen = false;
+    }
+
+    private void BackToObserve()
+    {
+        if (!DrawingIndividual) { comparison.StopPractice(); return; }
+        single.ExitDrawing();
+        panelOpen = detailsOpen = false;
     }
 
     private void ToggleAnswer()
     {
-        if (comparison.PracticeAnswerVisible) comparison.HidePracticeAnswer();
+        if (DrawingIndividual) single.ToggleAnswer();
+        else if (comparison.PracticeAnswerVisible) comparison.HidePracticeAnswer();
         else comparison.RevealPracticeAnswer();
+    }
+
+    private void ConsumePointerPress()
+    {
+        suppressLegacyThroughFrame = Time.frameCount;
+        if (UsingHeadset && confirmAction != null && confirmAction.GetState(SteamVR_Input_Sources.RightHand))
+            consumedTriggerHeld = true;
+        SyncLegacyDrawing();
     }
 
     private void SyncLegacyDrawing()
     {
-        bool shouldSuspend = comparison != null && comparison.IsActive ||
-            chinese != null && chinese.IsRegionVisible;
+        if (consumedTriggerHeld && (!UsingHeadset || confirmAction == null || !confirmAction.GetState(SteamVR_Input_Sources.RightHand)))
+        {
+            consumedTriggerHeld = false;
+            suppressLegacyThroughFrame = Time.frameCount;
+        }
+        bool shouldSuspend = comparison != null && comparison.IsActive || DrawingIndividual || detailsOpen || consumedTriggerHeld ||
+            chinese != null && chinese.IsRegionVisible || panelOpen || Time.frameCount <= suppressLegacyThroughFrame;
         if (shouldSuspend && !legacySuspended)
         {
             foreach (var legacy in FindObjectsOfType<DrawLineManager>(true))
